@@ -1,16 +1,14 @@
 import os
 import getpass
 from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import SupabaseVectorStore
 from supabase.client import create_client
-from langchain.memory import RetrievalQA #basic memory
-from langchain.memory import SimpleMemory
-from langchain.memory import ConversationBufferMemory ##these tow for advance RAG with memory
+from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
-from langchain.docstore.document import Document
+from langchain_core.documents import Document
 from dotenv import load_dotenv
 from datetime import datetime
 from typing import List, Dict, Any
