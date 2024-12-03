@@ -12,6 +12,7 @@ from langchain_core.documents import Document
 from dotenv import load_dotenv
 from datetime import datetime
 from typing import List, Dict, Any
+import hashlib
 from langchain_community.document_loaders import(
     PyPDFLoader, 
     PowerPointLoader,
@@ -23,8 +24,7 @@ from langchain_community.document_loaders import(
     UnstructuredMarkdownLoader,
     JSONLoader)
 
-
-#environment variables
+# Load environment variables
 load_dotenv()
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
@@ -32,25 +32,30 @@ os.environ["SUPABASE_URL"] = os.getenv("SUPABASE_URL")
 os.environ["SUPABASE_SERVICE_KEY"] = os.getenv("SUPABASE_SERVICE_KEY")
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 
-#Initialize Supabase client
+# Set up chat model
+chat_model = ChatOpenAI(temperature = 0.7)
+
+# Initialize Supabase client
 supabase = create_client(
     os.environ["SUPABASE_URL"],
     os.environ["SUPABASE_SERVICE_KEY"]
 )
-#initialize chat model
+
+# Initialize chat model
 model = ChatOpenAI(model="gpt-4-turbo")
-#initialize embeddings
+
+# Initialize embeddings
 embeddings = OpenAIEmbeddings()
 
-#create vector store using Supabase 
+# Create vector store using Supabase 
 vector_store = SupabaseVectorStore(
     client = supabase,
     embedding = embeddings,
-    table_name = "documents", ###remeber to create this table in supabase
-    query_name = "match_documents" ###remeber to create this query in supabase
+    table_name = "documents", # Remember to create this table in Supabase
+    query_name = "match_documents" # Remember to create this query in Supabase
 )
 
-#function to get loader based on file extension
+# Function to get loader based on file extension
 def get_loader(file_path):
     """Return appropriate loader based on file extension"""
     extension = file_path.lower().split('.')[-1]
@@ -81,8 +86,17 @@ def get_loader(file_path):
     
     return loader_class(file_path)
 
-#function to process the documents
+# Function to process the documents
 def process_document(file_path):
+    """
+    Process a document file into chunks.
+    
+    Args:
+        file_path (str): Path to the document file.
+    
+    Returns:
+        List[Document]: List of document chunks.
+    """
     try:
         # Get appropriate loader
         loader = get_loader(file_path)
@@ -104,22 +118,22 @@ def process_document(file_path):
         print(f"Error processing {file_path}: {str(e)}")
         raise
 
-#function to store documents into vector store
+# Function to store documents into vector store
 def store_documents_in_supabase(
     chunks: List[Document], 
     batch_size: int = 100,
     additional_metadata: Dict[str, Any] = None
 ) -> Dict[str, Any]:
     """
-    Store document chunks in Supabase with batching and metadata
+    Store document chunks in Supabase with batching and metadata.
     
     Args:
-        chunks: List of Document objects to store
-        batch_size: Number of chunks to process in each batch
-        additional_metadata: Optional additional metadata to add to all chunks
+        chunks (List[Document]): List of Document objects to store.
+        batch_size (int): Number of chunks to process in each batch.
+        additional_metadata (Dict[str, Any]): Optional additional metadata to add to all chunks.
     
     Returns:
-        Dict containing status and processing information
+        Dict[str, Any]: Status and processing information.
     """
     try:
         total_chunks = len(chunks)
@@ -183,9 +197,19 @@ def store_documents_in_supabase(
         print(f"Error storing documents: {str(e)}")
         return error_result
 
+# Set up retrieval chain
+retriever = vector_store.as_retriever(
+    search_type="similarity",
+    search_kwargs={"k": 3}  # Number of relevant chunks to retrieve
+)
 
+# Set up memory for conversation history
+memory = ConversationBufferMemory(
+    memory_key="chat_history",
+    return_messages=True
+)
 
-#Creating a Chat prompt template 
+# Creating a Chat prompt template 
 prompt_template = """
 You are a professor at a university helping students understand course materials. 
 Using the following context, guide but not explicitly answer the student's question.
@@ -197,5 +221,186 @@ Provide a detailed, educational response that will help with student's learning.
 """
 prompt = ChatPromptTemplate.from_template(prompt_template)
 
-#set up chat model
-chat_model = ChatOpenAI(temperature = 0.7)
+# Function to log queries and responses
+def log_query(question: str, response: Dict[str, Any]):
+    """
+    Log queries and responses for analysis.
+    
+    Args:
+        question (str): The user's question.
+        response (Dict[str, Any]): The system's response.
+    """
+    log_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "question": question,
+        "response": response["answer"] if response["status"] == "success" else None,
+        "status": response["status"],
+        "error": response.get("error")
+    }
+    # Store in Supabase (implementation not shown)
+
+class DocumentProcessor:
+    """
+    Class for processing and storing documents in Supabase.
+    """
+    def __init__(self, supabase_client, embeddings_model):
+        self.supabase = supabase_client
+        self.embeddings_model = embeddings_model
+        
+    def calculate_checksum(self, content: str) -> str:
+        """Calculate SHA-256 checksum of content"""
+        return hashlib.sha256(content.encode()).hexdigest()
+    
+    async def process_and_store_document(self, 
+                                       file_path: str,
+                                       parent_page_id: int = None,
+                                       document_type: str = None) -> Dict[str, Any]:
+        """
+        Process and store a document in Supabase.
+        
+        Args:
+            file_path (str): Path to the document file.
+            parent_page_id (int, optional): ID of the parent page.
+            document_type (str, optional): Type of the document.
+        
+        Returns:
+            Dict[str, Any]: Status and processing information.
+        """
+        try:
+            # Process document into chunks
+            chunks = process_document(file_path)
+            
+            # Create page entry
+            page_data = {
+                "parent_page_id": parent_page_id,
+                "path": file_path,
+                "checksum": self.calculate_checksum(str(chunks)),
+                "meta": {
+                    "processed_at": datetime.now().isoformat(),
+                    "chunk_count": len(chunks)
+                },
+                "type": document_type or file_path.split('.')[-1],
+                "source": "file_upload"
+            }
+            
+            # Insert page and get ID
+            page_result = self.supabase.table("nods_page").insert(page_data).execute()
+            page_id = page_result.data[0]['id']
+            
+            # Process and store sections
+            sections = []
+            for i, chunk in enumerate(chunks):
+                # Generate embedding
+                embedding = self.embeddings_model.embed_query(chunk.page_content)
+                
+                section_data = {
+                    "page_id": page_id,
+                    "content": chunk.page_content,
+                    "token_count": len(chunk.page_content.split()),  # Simple token count
+                    "embedding": embedding,
+                    "slug": f"section-{i}",
+                    "heading": chunk.metadata.get('heading', f"Section {i}")
+                }
+                sections.append(section_data)
+                
+                # Store in batches of 100
+                if len(sections) >= 100:
+                    self.supabase.table("nods_page_section").insert(sections).execute()
+                    sections = []
+            
+            # Store any remaining sections
+            if sections:
+                self.supabase.table("nods_page_section").insert(sections).execute()
+                
+            return {
+                "status": "success",
+                "page_id": page_id,
+                "sections_count": len(chunks)
+            }
+            
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": str(e),
+                "error_type": type(e).__name__
+            }
+
+class EnhancedRetriever:
+    """
+    Class for retrieving relevant sections from Supabase.
+    """
+    def __init__(self, supabase_client, embeddings_model):
+        self.supabase = supabase_client
+        self.embeddings_model = embeddings_model
+        
+    async def get_relevant_sections(self, 
+                                  query: str, 
+                                  match_threshold: float = 0.5,
+                                  match_count: int = 5,
+                                  min_content_length: int = 50) -> List[Dict]:
+        """
+        Retrieve relevant sections based on a query.
+        
+        Args:
+            query (str): The search query.
+            match_threshold (float): Minimum similarity score for a match.
+            match_count (int): Maximum number of matches to return.
+            min_content_length (int): Minimum content length for a section to be considered.
+        
+        Returns:
+            List[Dict]: List of relevant sections with their metadata.
+        """
+        # Generate embedding for query
+        query_embedding = self.embeddings_model.embed_query(query)
+        
+        # Call the similarity search function
+        result = self.supabase.rpc(
+            'match_page_sections',
+            {
+                'embedding': query_embedding,
+                'match_threshold': match_threshold,
+                'match_count': match_count,
+                'min_content_length': min_content_length
+            }
+        ).execute()
+        
+        # Get parent pages for context
+        sections = result.data
+        for section in sections:
+            parents = self.supabase.rpc(
+                'get_page_parents',
+                {'page_id': section['page_id']}
+            ).execute()
+            section['parents'] = parents.data
+            
+        return sections
+
+# Function to set up the RAG chain
+def setup_rag_chain(document_processor: DocumentProcessor, 
+                   retriever: EnhancedRetriever,
+                   chat_model: ChatOpenAI):
+    """
+    Set up the Retrieval-Augmented Generation (RAG) chain.
+    
+    Args:
+        document_processor (DocumentProcessor): Instance of DocumentProcessor.
+        retriever (EnhancedRetriever): Instance of EnhancedRetriever.
+        chat_model (ChatOpenAI): Instance of ChatOpenAI.
+    
+    Returns:
+        ConversationalRetrievalChain: The configured RAG chain.
+    """
+    memory = ConversationBufferMemory(
+        memory_key="chat_history",
+        return_messages=True
+    )
+    
+    rag_chain = ConversationalRetrievalChain.from_llm(
+        llm=chat_model,
+        retriever=retriever,
+        memory=memory,
+        return_source_documents=True,
+        combine_docs_chain_kwargs={'prompt': prompt}
+    )
+    
+    return rag_chain
