@@ -13,10 +13,10 @@ from dotenv import load_dotenv
 from datetime import datetime
 from typing import List, Dict, Any
 import hashlib
+from pathlib import Path
+import asyncio
 from langchain_community.document_loaders import(
     PyPDFLoader, 
-    PowerPointLoader,
-    WordDocumentLoader,
     TextLoader,
     CSVLoader,
     UnstructuredExcelLoader,
@@ -51,8 +51,8 @@ embeddings = OpenAIEmbeddings()
 vector_store = SupabaseVectorStore(
     client = supabase,
     embedding = embeddings,
-    table_name = "documents", # Remember to create this table in Supabase
-    query_name = "match_documents" # Remember to create this query in Supabase
+    table_name = "nods_page_section", 
+    query_name = "match_page_sections" 
 )
 
 # Function to get loader based on file extension
@@ -63,11 +63,7 @@ def get_loader(file_path):
     loaders = {
         # Documents
         'pdf': PyPDFLoader,
-        'ppt': PowerPointLoader,
-        'pptx': PowerPointLoader,
-        'doc': WordDocumentLoader,
-        'docx': WordDocumentLoader,
-        
+      
         # Data files
         'txt': TextLoader,
         'csv': CSVLoader,
@@ -326,55 +322,47 @@ class DocumentProcessor:
             }
 
 class EnhancedRetriever:
-    """
-    Class for retrieving relevant sections from Supabase.
-    """
+    """Class for retrieving relevant sections from Supabase."""
     def __init__(self, supabase_client, embeddings_model):
         self.supabase = supabase_client
         self.embeddings_model = embeddings_model
-        
-    async def get_relevant_sections(self, 
-                                  query: str, 
-                                  match_threshold: float = 0.5,
-                                  match_count: int = 5,
-                                  min_content_length: int = 50) -> List[Dict]:
-        """
-        Retrieve relevant sections based on a query.
-        
-        Args:
-            query (str): The search query.
-            match_threshold (float): Minimum similarity score for a match.
-            match_count (int): Maximum number of matches to return.
-            min_content_length (int): Minimum content length for a section to be considered.
-        
-        Returns:
-            List[Dict]: List of relevant sections with their metadata.
-        """
-        # Generate embedding for query
-        query_embedding = self.embeddings_model.embed_query(query)
-        
-        # Call the similarity search function
-        result = self.supabase.rpc(
+    
+    def get_relevant_documents(self, query: str) -> List[Document]:
+        """Required method for Langchain retriever interface"""
+        # Convert the async method to sync for Langchain compatibility
+        sections = self.supabase.rpc(
             'match_page_sections',
             {
-                'embedding': query_embedding,
-                'match_threshold': match_threshold,
-                'match_count': match_count,
-                'min_content_length': min_content_length
+                'embedding': self.embeddings_model.embed_query(query),
+                'match_threshold': 0.5,
+                'match_count': 5,
+                'min_content_length': 50
             }
         ).execute()
         
-        # Get parent pages for context
-        sections = result.data
-        for section in sections:
+        # Convert sections to Langchain Documents
+        documents = []
+        for section in sections.data:
+            # Get parent pages for context
             parents = self.supabase.rpc(
                 'get_page_parents',
                 {'page_id': section['page_id']}
             ).execute()
-            section['parents'] = parents.data
             
-        return sections
-
+            # Create metadata including parents
+            metadata = {
+                'page_id': section['page_id'],
+                'parents': parents.data
+            }
+            
+            # Create Document object
+            doc = Document(
+                page_content=section['content'],
+                metadata=metadata
+            )
+            documents.append(doc)
+        
+        return documents
 # Function to set up the RAG chain
 def setup_rag_chain(document_processor: DocumentProcessor, 
                    retriever: EnhancedRetriever,
@@ -404,3 +392,80 @@ def setup_rag_chain(document_processor: DocumentProcessor,
     )
     
     return rag_chain
+
+class BatchDocumentProcessor:
+    def __init__(self, doc_processor: DocumentProcessor):
+        self.doc_processor = doc_processor
+
+    async def process_directory(self, directory_path: str) -> List[Dict[str, Any]]:
+        """Process all supported documents in a directory"""
+        directory = Path(directory_path)
+        results = []
+        
+        # Get all files in directory
+        supported_extensions = {
+            '.pdf', '.docx', '.doc', '.txt', '.csv', 
+            '.xlsx', '.xls', '.html', '.md', '.json',
+            '.pptx', '.ppt'
+        }
+        
+        files = [
+            f for f in directory.glob('**/*') 
+            if f.is_file() and f.suffix.lower() in supported_extensions
+        ]
+        
+        # Process each file
+        for file_path in files:
+            try:
+                result = await self.doc_processor.process_and_store_document(
+                    str(file_path),
+                    document_type=file_path.suffix[1:]  # Remove the dot from extension
+                )
+                results.append({
+                    "file": str(file_path),
+                    "result": result
+                })
+                print(f"Processed {file_path}")
+            except Exception as e:
+                results.append({
+                    "file": str(file_path),
+                    "error": str(e)
+                })
+                print(f"Error processing {file_path}: {e}")
+        
+        return results
+
+async def process_and_query_documents(directory_path: str, query: str):
+    try:
+        # Initialize batch processor
+        doc_processor = DocumentProcessor(supabase, embeddings)
+        batch_processor = BatchDocumentProcessor(doc_processor)
+        
+        # Process all documents
+        processing_results = await batch_processor.process_directory(directory_path)
+        print("Documents processing results:", processing_results)
+
+        # Query across all processed documents
+        #From:
+        sections = await retriever.get_relevant_documents(
+            query,
+            match_threshold=0.5,
+            match_count=5
+        )
+        #To 
+        sections = retriever.get_relevant_documents(query)
+        print("Retrieved sections:", sections)
+
+        return processing_results, sections
+
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return None, None
+
+if __name__ == "__main__":
+    # Directory containing your documents
+    docs_directory = "/Users/miki/desktop/langchain_rag/data/"
+    query = "What are the main topics across these documents?"
+    
+    # Run the async function
+    results, sections = asyncio.run(process_and_query_documents(docs_directory, query))
