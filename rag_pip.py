@@ -15,7 +15,9 @@ from typing import List, Dict, Any
 import hashlib
 from pathlib import Path
 import asyncio
+from langchain_core.retrievers import BaseRetriever
 from langchain_community.document_loaders import(
+    DirectoryLoader,
     PyPDFLoader, 
     TextLoader,
     CSVLoader,
@@ -52,7 +54,8 @@ vector_store = SupabaseVectorStore(
     client = supabase,
     embedding = embeddings,
     table_name = "nods_page_section", 
-    query_name = "match_page_sections" 
+    query_name = "match_page_sections", 
+    
 )
 
 # Function to get loader based on file extension
@@ -202,7 +205,8 @@ retriever = vector_store.as_retriever(
 # Set up memory for conversation history
 memory = ConversationBufferMemory(
     memory_key="chat_history",
-    return_messages=True
+    return_messages=True,
+    output_key="answer"
 )
 
 # Creating a Chat prompt template 
@@ -242,7 +246,39 @@ class DocumentProcessor:
     def __init__(self, supabase_client, embeddings_model):
         self.supabase = supabase_client
         self.embeddings_model = embeddings_model
-        
+        self.loader = DirectoryLoader("", glob="**/*.pdf", loader_cls=PyPDFLoader)
+
+    async def process_document(self, file_path: str) -> Dict:
+        try:
+            # Check if document already exists in nods_page_section table
+            result = await self.supabase.table("nods").select("*").eq("path", file_path).execute()
+            if result.data:
+                print(f"Skipping {file_path} - already exists")
+                return {
+                    "status": "skipped",
+                    "message": "Document already exists",
+                    "path": file_path
+                }
+            
+            # If document doesn't exist, continue with processing
+            loader = PyPDFLoader(file_path)
+            pages = loader.load()
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200
+            )
+            sections = text_splitter.split_documents(pages)
+            
+            # Store sections in Supabase
+            return await self.store_document(file_path, sections)
+            
+        except Exception as e:
+            return {
+                "status": "error", 
+                "error": str(e), 
+                "error_type": type(e).__name__,
+                "path": file_path
+            }
     def calculate_checksum(self, content: str) -> str:
         """Calculate SHA-256 checksum of content"""
         return hashlib.sha256(content.encode()).hexdigest()
@@ -264,6 +300,13 @@ class DocumentProcessor:
         """
         try:
             # Process document into chunks
+            result =  self.supabase.table("nods_page_section").select("*").eq("path", file_path).execute()
+            if result.data:
+                print(f"Document already exists in Supabase: {file_path}")
+                return{
+                    "status": "skipped",
+                    "message": f"Document already exists in Supabase"
+                }
             chunks = process_document(file_path)
             
             # Create page entry
@@ -321,22 +364,19 @@ class DocumentProcessor:
                 "error_type": type(e).__name__
             }
 
-class EnhancedRetriever:
+class EnhancedRetriever(BaseRetriever):
     """Class for retrieving relevant sections from Supabase."""
     def __init__(self, supabase_client, embeddings_model):
+        super().__init__()
         self.supabase = supabase_client
         self.embeddings_model = embeddings_model
     
-    def get_relevant_documents(self, query: str) -> List[Document]:
-        """Required method for Langchain retriever interface"""
-        # Convert the async method to sync for Langchain compatibility
+    async def _aget_relevant_documents(self, query: str) -> List[Document]:
+        """Async method for getting relevant documents"""
         sections = self.supabase.rpc(
             'match_page_sections',
             {
-                'embedding': self.embeddings_model.embed_query(query),
-                'match_threshold': 0.5,
-                'match_count': 5,
-                'min_content_length': 50
+                'embedding': self.embeddings_model.embed_query(query)
             }
         ).execute()
         
@@ -363,6 +403,10 @@ class EnhancedRetriever:
             documents.append(doc)
         
         return documents
+
+    def _get_relevant_documents(self, query: str) -> List[Document]:
+        """Sync method for getting relevant documents"""
+        return asyncio.run(self._aget_relevant_documents(query))
 # Function to set up the RAG chain
 def setup_rag_chain(document_processor: DocumentProcessor, 
                    retriever: EnhancedRetriever,
@@ -380,7 +424,8 @@ def setup_rag_chain(document_processor: DocumentProcessor,
     """
     memory = ConversationBufferMemory(
         memory_key="chat_history",
-        return_messages=True
+        return_messages=True,
+        output_key="answer"
     )
     
     rag_chain = ConversationalRetrievalChain.from_llm(
@@ -443,29 +488,37 @@ async def process_and_query_documents(directory_path: str, query: str):
         
         # Process all documents
         processing_results = await batch_processor.process_directory(directory_path)
-        print("Documents processing results:", processing_results)
+        print("\n=== Document Processing Results ===")
+        print("Documents processed:", len(processing_results))
+        print("Successful:", len([r for r in processing_results if r['result'].get('status') == 'success']))
+        print("Skipped:", len([r for r in processing_results if r['result'].get('status') == 'skipped']))
+        print("Errors:", len([r for r in processing_results if r.get('error')]))
 
-        # Query across all processed documents
-        #From:
-        sections = await retriever.get_relevant_documents(
-            query,
-            match_threshold=0.5,
-            match_count=5
-        )
-        #To 
-        sections = retriever.get_relevant_documents(query)
-        print("Retrieved sections:", sections)
+        # Set up RAG chain
+        rag_chain = setup_rag_chain(doc_processor, retriever, chat_model)
 
-        return processing_results, sections
+        print("\n=== Query Processing ===")
+        print("Query:", query)
+
+        # Get the response using the RAG chain (only once)
+        response = rag_chain.invoke({"question": query})
+        print("\nResponse:", response["answer"])
+
+        # Get relevant sections
+        sections = await retriever.ainvoke(query)
+        print('\nRelevant sections found:', len(sections))
+        if sections:
+            print('First section preview:', sections[0].page_content[:200] + '...')
+
+        return processing_results, response
 
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"\nError in process_and_query_documents: {str(e)}")
         return None, None
-
 if __name__ == "__main__":
     # Directory containing your documents
     docs_directory = "/Users/miki/desktop/langchain_rag/data/"
     query = "What are the main topics across these documents?"
     
     # Run the async function
-    results, sections = asyncio.run(process_and_query_documents(docs_directory, query))
+    results, response = asyncio.run(process_and_query_documents(docs_directory, query))
