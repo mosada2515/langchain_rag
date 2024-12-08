@@ -6,8 +6,8 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import SupabaseVectorStore
 from supabase.client import create_client
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
+from langchain_community.memory import ConversationBufferMemory
+from langchain_community.chains import ConversationalRetrievalChain
 from langchain_core.documents import Document
 from dotenv import load_dotenv
 from datetime import datetime
@@ -217,7 +217,7 @@ def process_document(file_path):
     """
     try:
         # Get appropriate loader
-        loader = get_loader(file_path)
+        loader = DirectoryLoader(Path(file_path).parent, glob=Path(file_path).name)
         
         # Load the document
         documents = loader.load()
