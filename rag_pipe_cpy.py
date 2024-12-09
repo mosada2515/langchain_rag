@@ -63,17 +63,19 @@ class ConversationManager:
         self.retriever = retriever
         self.supabase = supabase_client
         self.chat_model = chat_model or ChatOpenAI(temperature=0.5)
-        self.memory = self._initialize_memory()
+        self.memory = ConversationBufferMemory(
+            memory_key = "chat_history",
+            return_messages = True
+        )
         self.rag_chain = self._initialize_rag_chain()
-        self.conversation_id = None
     
     def _initialize_memory(self) -> ConversationBufferMemory:
         """Initialize the conversation memory"""
-        return ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True,
-            output_key="answer",
-            memory_version="2.0"
+        return ConversationalRetrievalChain.from_llm(
+            llm=self.chat_model,
+            retriever=self.retriever,
+            memory=self.memory,
+            combine_docs_chain_kwargs={"prompt": prompt_template}
         )
     
     def _initialize_rag_chain(self) -> ConversationalRetrievalChain:
@@ -148,42 +150,12 @@ class ConversationManager:
     
     async def process_query(self, query: str) -> Dict[str, Any]:
         """Process a query and store it in conversation history"""
-        try:
-            if not self.conversation_id:
-                raise Exception("No active conversation ID")
-            
-            # Store the user's query
-            await self.store_message(
-                conversation_id=self.conversation_id,
-                content=query,
-                role="user"
-            )
-            
-            # Process the query
+       try:
             response = self.rag_chain.invoke({"question": query})
-            answer = response.get("answer", "")
-            
-            # Store the assistant's response
-            if answer:
-                await self.store_message(
-                    conversation_id=self.conversation_id,
-                    content=answer,
-                    role="assistant"
-                )
-            
-            return {
-                "status": "success",
-                "answer": answer,
-                "source_documents": response.get("source_documents", []),
-                "conversation_id": self.conversation_id
-            }
+            return response
         except Exception as e:
-            print(f"Error processing query: {str(e)}")
-            return {
-                "status": "error",
-                "error": str(e),
-                "conversation_id": self.conversation_id
-            }
+            print(f"Error processing query: {e}")
+            return {"error": str(e)}
     
     def get_conversation_history(self) -> list:
         """Get the conversation history from the memory"""
