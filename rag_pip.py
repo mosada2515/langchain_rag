@@ -6,8 +6,8 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import SupabaseVectorStore
 from supabase.client import create_client
-from langchain_community.memory import ConversationBufferMemory
-from langchain_community.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain.chains.conversational_retrieval.base import ConversationalRetrievalChain
 from langchain_core.documents import Document
 from dotenv import load_dotenv
 from datetime import datetime
